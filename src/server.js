@@ -2,7 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import pg from 'pg'
 import multer from 'multer'
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
+import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -486,6 +486,69 @@ app.post('/api/ladies/media/upload', upload.single('file'), async (req, res) => 
 
 
 
+
+
+
+app.delete('/api/ladies/media/:id', async (req, res) => {
+  try {
+    await ensureDatabaseTables()
+
+    const db = getPool()
+    if (!db) {
+      return res.status(400).json({
+        ok: false,
+        message: '尚未設定 DATABASE_URL，無法刪除媒體資料。'
+      })
+    }
+
+    const mediaId = Number(req.params.id || 0)
+    if (!mediaId) {
+      return res.status(400).json({
+        ok: false,
+        message: '缺少有效的 media id。'
+      })
+    }
+
+    const found = await db.query(
+      'select id, object_key, url from lady_media where id = $1 limit 1',
+      [mediaId]
+    )
+
+    if (!found.rows.length) {
+      return res.status(404).json({
+        ok: false,
+        message: '找不到要刪除的媒體資料。'
+      })
+    }
+
+    const media = found.rows[0]
+
+    if (media.object_key) {
+      try {
+        const r2 = getR2Client()
+        await r2.send(new DeleteObjectCommand({
+          Bucket: r2BucketName,
+          Key: media.object_key
+        }))
+      } catch (r2Error) {
+        console.warn('R2 delete failed, continue deleting DB row:', r2Error)
+      }
+    }
+
+    await db.query('delete from lady_media where id = $1', [mediaId])
+
+    return res.json({
+      ok: true,
+      message: '媒體已從 Supabase 刪除；若有 R2 object_key 也已嘗試刪除。',
+      item: media
+    })
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      message: error.message || String(error)
+    })
+  }
+})
 
 function parseTextLines(value) {
   if (Array.isArray(value)) {
