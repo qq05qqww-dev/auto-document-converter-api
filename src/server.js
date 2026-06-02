@@ -656,6 +656,7 @@ app.patch('/api/ladies/:id', async (req, res) => {
 
 app.get('/api/public/ladies', async (req, res) => {
   try {
+    const includeInactive = String(req.query.includeInactive || '') === '1'
     await ensureDatabaseTables()
 
     const db = getPool()
@@ -675,9 +676,9 @@ app.get('/api/public/ladies', async (req, res) => {
         imported_at,
         updated_at
       from ladies
-      where is_active = true
+      where ($1::boolean = true or is_active = true)
       order by sort_order asc, id asc
-    `)
+    `, [includeInactive])
 
     const ladyIds = ladiesResult.rows.map(item => item.id)
 
@@ -808,165 +809,6 @@ app.get('/api/public/ladies', async (req, res) => {
 
 
 
-app.get('/api/public/ladies', async (req, res) => {
-  if (!pool) {
-    return res.status(500).json({
-      ok: false,
-      message: '尚未設定 DATABASE_URL。請先在 backend/.env 或部署環境變數設定 Supabase PostgreSQL 連線字串。'
-    })
-  }
-
-  try {
-    const includeInactive = String(req.query.includeInactive || '') === '1'
-
-    const ladiesResult = await pool.query(`
-      SELECT
-        id,
-        country,
-        name,
-        height,
-        weight,
-        cup,
-        age,
-        raw_text,
-        is_active,
-        created_at,
-        updated_at
-      FROM ladies
-      WHERE ($1::boolean = true OR COALESCE(is_active, true) = true)
-      ORDER BY id ASC
-    `, [includeInactive])
-
-    const priceResult = await pool.query(`
-      SELECT
-        id,
-        lady_id,
-        price_text,
-        price,
-        minutes,
-        sessions,
-        sort_order
-      FROM lady_price_plans
-      ORDER BY lady_id ASC, sort_order ASC, id ASC
-    `)
-
-    const serviceResult = await pool.query(`
-      SELECT
-        id,
-        lady_id,
-        service_name,
-        sort_order
-      FROM lady_services
-      ORDER BY lady_id ASC, sort_order ASC, id ASC
-    `)
-
-    let mediaResult = { rows: [] }
-
-    try {
-      mediaResult = await pool.query(`
-        SELECT
-          id,
-          lady_id,
-          media_type,
-          url,
-          object_key,
-          note,
-          created_at,
-          uploaded_at
-        FROM lady_media
-        ORDER BY lady_id ASC, id ASC
-      `)
-    } catch (mediaError) {
-      console.warn('lady_media read skipped:', mediaError.message)
-      mediaResult = { rows: [] }
-    }
-
-    const pricesByLadyId = new Map()
-    for (const row of priceResult.rows) {
-      const key = Number(row.lady_id)
-      if (!pricesByLadyId.has(key)) pricesByLadyId.set(key, [])
-      pricesByLadyId.get(key).push({
-        id: row.id,
-        priceText: row.price_text,
-        price: row.price,
-        minutes: row.minutes,
-        sessions: row.sessions,
-        sortOrder: row.sort_order
-      })
-    }
-
-    const servicesByLadyId = new Map()
-    for (const row of serviceResult.rows) {
-      const key = Number(row.lady_id)
-      if (!servicesByLadyId.has(key)) servicesByLadyId.set(key, [])
-      servicesByLadyId.get(key).push({
-        id: row.id,
-        serviceName: row.service_name,
-        sortOrder: row.sort_order
-      })
-    }
-
-    const mediaByLadyId = new Map()
-    for (const row of mediaResult.rows) {
-      const key = Number(row.lady_id)
-      if (!mediaByLadyId.has(key)) mediaByLadyId.set(key, [])
-      mediaByLadyId.get(key).push({
-        id: row.id,
-        mediaType: row.media_type || 'image',
-        media_type: row.media_type || 'image',
-        url: row.url,
-        objectKey: row.object_key || '',
-        object_key: row.object_key || '',
-        note: row.note || '',
-        createdAt: row.created_at || row.uploaded_at || null,
-        uploadedAt: row.uploaded_at || row.created_at || null
-      })
-    }
-
-    const items = ladiesResult.rows.map((row) => {
-      const ladyId = Number(row.id)
-      return {
-        id: ladyId,
-        country: row.country || '',
-        name: row.name || '',
-        height: row.height,
-        weight: row.weight,
-        cup: row.cup || '',
-        age: row.age,
-        rawText: row.raw_text || '',
-        raw_text: row.raw_text || '',
-        isActive: row.is_active,
-        is_active: row.is_active,
-        createdAt: row.created_at,
-        created_at: row.created_at,
-        updatedAt: row.updated_at,
-        updated_at: row.updated_at,
-        pricePlans: pricesByLadyId.get(ladyId) || [],
-        price_plans: pricesByLadyId.get(ladyId) || [],
-        services: servicesByLadyId.get(ladyId) || [],
-        media: mediaByLadyId.get(ladyId) || []
-      }
-    })
-
-    return res.json({
-      ok: true,
-      count: items.length,
-      items,
-      debug: {
-        ladies: ladiesResult.rows.length,
-        pricePlans: priceResult.rows.length,
-        services: serviceResult.rows.length,
-        media: mediaResult.rows.length
-      }
-    })
-  } catch (error) {
-    console.error('GET /api/public/ladies failed:', error)
-    return res.status(500).json({
-      ok: false,
-      message: error.message || '讀取前台資料失敗'
-    })
-  }
-})
 
 app.listen(port, async () => {
   await ensureDataFile()
