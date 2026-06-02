@@ -1,6 +1,6 @@
 {
   "name": "auto-document-converter-api",
-  "version": "0.0.14-3-edit-ladies-status",
+  "version": "0.0.14-4-public-ladies-include-inactive",
   "type": "module",
   "scripts": {
     "dev": "node src/server.js",

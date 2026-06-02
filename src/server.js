@@ -654,7 +654,7 @@ app.patch('/api/ladies/:id', async (req, res) => {
   }
 })
 
-app.get('/api/public/ladies', async (_req, res) => {
+app.get('/api/public/ladies', async (req, res) => {
   try {
     await ensureDatabaseTables()
 
@@ -817,6 +817,8 @@ app.get('/api/public/ladies', async (req, res) => {
   }
 
   try {
+    const includeInactive = String(req.query.includeInactive || '') === '1'
+
     const ladiesResult = await pool.query(`
       SELECT
         id,
@@ -831,9 +833,9 @@ app.get('/api/public/ladies', async (req, res) => {
         created_at,
         updated_at
       FROM ladies
-      WHERE COALESCE(is_active, true) = true
+      WHERE ($1::boolean = true OR COALESCE(is_active, true) = true)
       ORDER BY id ASC
-    `)
+    `, [includeInactive])
 
     const priceResult = await pool.query(`
       SELECT
