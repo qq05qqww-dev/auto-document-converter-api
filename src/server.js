@@ -485,6 +485,173 @@ app.post('/api/ladies/media/upload', upload.single('file'), async (req, res) => 
 })
 
 
+
+
+function parseTextLines(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+  }
+
+  return String(value || '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function parsePricePlanText(priceText, sortOrder) {
+  const text = String(priceText || '').trim()
+  const priceMatch = text.match(/(\d+(?:\.\d+)?)\s*K/i)
+  const rawPriceMatch = text.match(/^(\d{3,5})\s*\//)
+  const minutesMatch = text.match(/\/\s*(\d+)\s*\//)
+  const sessionMatch = text.match(/\/\s*[^/]*?(\d+(?:\.\d+)?|0\.5)\s*S?/i)
+
+  let price = null
+  if (priceMatch) {
+    price = Math.round(Number(priceMatch[1]) * 1000)
+  } else if (rawPriceMatch) {
+    price = Number(rawPriceMatch[1])
+  }
+
+  return {
+    priceText: text,
+    price,
+    minutes: minutesMatch ? Number(minutesMatch[1]) : null,
+    sessions: sessionMatch ? Number(sessionMatch[1]) : 1,
+    sortOrder
+  }
+}
+
+app.patch('/api/ladies/:id', async (req, res) => {
+  const ladyId = Number(req.params.id || 0)
+
+  if (!ladyId) {
+    return res.status(400).json({
+      ok: false,
+      message: '缺少有效的 lady id。'
+    })
+  }
+
+  const db = getPool()
+  if (!db) {
+    return res.status(400).json({
+      ok: false,
+      message: '尚未設定 DATABASE_URL，無法更新 Supabase 小姐資料。'
+    })
+  }
+
+  const body = req.body || {}
+  const name = String(body.name || '').trim()
+  const country = String(body.country || body.nationality || body.city || '').trim()
+  const cup = String(body.cup || '').trim()
+  const rawText = String(body.rawText || body.raw_text || body.description || '').trim()
+  const priceLines = parseTextLines(body.pricePlansText || body.plansText || body.prices || body.plans)
+  const serviceLines = parseTextLines(body.servicesText || body.services || body.serviceList)
+
+  if (!name) {
+    return res.status(400).json({
+      ok: false,
+      message: '請先輸入姓名。'
+    })
+  }
+
+  const client = await db.connect()
+
+  try {
+    await ensureDatabaseTables()
+    await client.query('begin')
+
+    const updatedLady = await client.query(
+      `
+        update ladies
+        set
+          country = $1,
+          name = $2,
+          height = $3,
+          weight = $4,
+          cup = $5,
+          age = $6,
+          raw_text = coalesce(nullif($7, ''), raw_text),
+          updated_at = now()
+        where id = $8
+        returning *
+      `,
+      [
+        country,
+        name,
+        body.height === '' || body.height === null || body.height === undefined ? null : Number(body.height),
+        body.weight === '' || body.weight === null || body.weight === undefined ? null : Number(body.weight),
+        cup,
+        body.age === '' || body.age === null || body.age === undefined ? null : Number(body.age),
+        rawText,
+        ladyId
+      ]
+    )
+
+    if (!updatedLady.rows.length) {
+      await client.query('rollback')
+      return res.status(404).json({
+        ok: false,
+        message: '找不到要更新的小姐資料。'
+      })
+    }
+
+    await client.query('delete from lady_price_plans where lady_id = $1', [ladyId])
+    for (const [index, line] of priceLines.entries()) {
+      const plan = parsePricePlanText(line, index + 1)
+      await client.query(
+        `
+          insert into lady_price_plans (
+            lady_id,
+            price_text,
+            price,
+            minutes,
+            sessions,
+            sort_order
+          )
+          values ($1, $2, $3, $4, $5, $6)
+        `,
+        [ladyId, plan.priceText, plan.price, plan.minutes, plan.sessions, plan.sortOrder]
+      )
+    }
+
+    await client.query('delete from lady_services where lady_id = $1', [ladyId])
+    for (const [index, serviceName] of serviceLines.entries()) {
+      await client.query(
+        `
+          insert into lady_services (
+            lady_id,
+            service_name,
+            sort_order
+          )
+          values ($1, $2, $3)
+        `,
+        [ladyId, serviceName, index + 1]
+      )
+    }
+
+    await client.query('commit')
+
+    return res.json({
+      ok: true,
+      message: '自動更新資料已同步更新到 Supabase。',
+      item: updatedLady.rows[0],
+      pricePlanCount: priceLines.length,
+      serviceCount: serviceLines.length
+    })
+  } catch (error) {
+    await client.query('rollback')
+    console.error('PATCH /api/ladies/:id failed:', error)
+    return res.status(500).json({
+      ok: false,
+      message: error.message || String(error)
+    })
+  } finally {
+    client.release()
+  }
+})
+
 app.get('/api/public/ladies', async (_req, res) => {
   try {
     await ensureDatabaseTables()
@@ -637,6 +804,165 @@ app.get('/api/public/ladies', async (_req, res) => {
   }
 })
 
+
+
+app.get('/api/public/ladies', async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({
+      ok: false,
+      message: '尚未設定 DATABASE_URL。請先在 backend/.env 或部署環境變數設定 Supabase PostgreSQL 連線字串。'
+    })
+  }
+
+  try {
+    const ladiesResult = await pool.query(`
+      SELECT
+        id,
+        country,
+        name,
+        height,
+        weight,
+        cup,
+        age,
+        raw_text,
+        is_active,
+        created_at,
+        updated_at
+      FROM ladies
+      WHERE COALESCE(is_active, true) = true
+      ORDER BY id ASC
+    `)
+
+    const priceResult = await pool.query(`
+      SELECT
+        id,
+        lady_id,
+        price_text,
+        price,
+        minutes,
+        sessions,
+        sort_order
+      FROM lady_price_plans
+      ORDER BY lady_id ASC, sort_order ASC, id ASC
+    `)
+
+    const serviceResult = await pool.query(`
+      SELECT
+        id,
+        lady_id,
+        service_name,
+        sort_order
+      FROM lady_services
+      ORDER BY lady_id ASC, sort_order ASC, id ASC
+    `)
+
+    let mediaResult = { rows: [] }
+
+    try {
+      mediaResult = await pool.query(`
+        SELECT
+          id,
+          lady_id,
+          media_type,
+          url,
+          object_key,
+          note,
+          created_at,
+          uploaded_at
+        FROM lady_media
+        ORDER BY lady_id ASC, id ASC
+      `)
+    } catch (mediaError) {
+      console.warn('lady_media read skipped:', mediaError.message)
+      mediaResult = { rows: [] }
+    }
+
+    const pricesByLadyId = new Map()
+    for (const row of priceResult.rows) {
+      const key = Number(row.lady_id)
+      if (!pricesByLadyId.has(key)) pricesByLadyId.set(key, [])
+      pricesByLadyId.get(key).push({
+        id: row.id,
+        priceText: row.price_text,
+        price: row.price,
+        minutes: row.minutes,
+        sessions: row.sessions,
+        sortOrder: row.sort_order
+      })
+    }
+
+    const servicesByLadyId = new Map()
+    for (const row of serviceResult.rows) {
+      const key = Number(row.lady_id)
+      if (!servicesByLadyId.has(key)) servicesByLadyId.set(key, [])
+      servicesByLadyId.get(key).push({
+        id: row.id,
+        serviceName: row.service_name,
+        sortOrder: row.sort_order
+      })
+    }
+
+    const mediaByLadyId = new Map()
+    for (const row of mediaResult.rows) {
+      const key = Number(row.lady_id)
+      if (!mediaByLadyId.has(key)) mediaByLadyId.set(key, [])
+      mediaByLadyId.get(key).push({
+        id: row.id,
+        mediaType: row.media_type || 'image',
+        media_type: row.media_type || 'image',
+        url: row.url,
+        objectKey: row.object_key || '',
+        object_key: row.object_key || '',
+        note: row.note || '',
+        createdAt: row.created_at || row.uploaded_at || null,
+        uploadedAt: row.uploaded_at || row.created_at || null
+      })
+    }
+
+    const items = ladiesResult.rows.map((row) => {
+      const ladyId = Number(row.id)
+      return {
+        id: ladyId,
+        country: row.country || '',
+        name: row.name || '',
+        height: row.height,
+        weight: row.weight,
+        cup: row.cup || '',
+        age: row.age,
+        rawText: row.raw_text || '',
+        raw_text: row.raw_text || '',
+        isActive: row.is_active,
+        is_active: row.is_active,
+        createdAt: row.created_at,
+        created_at: row.created_at,
+        updatedAt: row.updated_at,
+        updated_at: row.updated_at,
+        pricePlans: pricesByLadyId.get(ladyId) || [],
+        price_plans: pricesByLadyId.get(ladyId) || [],
+        services: servicesByLadyId.get(ladyId) || [],
+        media: mediaByLadyId.get(ladyId) || []
+      }
+    })
+
+    return res.json({
+      ok: true,
+      count: items.length,
+      items,
+      debug: {
+        ladies: ladiesResult.rows.length,
+        pricePlans: priceResult.rows.length,
+        services: serviceResult.rows.length,
+        media: mediaResult.rows.length
+      }
+    })
+  } catch (error) {
+    console.error('GET /api/public/ladies failed:', error)
+    return res.status(500).json({
+      ok: false,
+      message: error.message || '讀取前台資料失敗'
+    })
+  }
+})
 
 app.listen(port, async () => {
   await ensureDataFile()

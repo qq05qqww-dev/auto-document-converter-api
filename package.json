@@ -1,6 +1,6 @@
 {
   "name": "auto-document-converter-api",
-  "version": "0.0.15-public-card-media-display",
+  "version": "0.0.14-2-edit-ladies-sync-supabase",
   "type": "module",
   "scripts": {
     "dev": "node src/server.js",
