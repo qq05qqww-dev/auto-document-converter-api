@@ -1,6 +1,6 @@
 {
   "name": "auto-document-converter-api",
-  "version": "0.0.14-7-converter-include-inactive-admin-fix",
+  "version": "0.0.14-8-delete-lady-cascade",
   "type": "module",
   "scripts": {
     "dev": "node src/server.js",

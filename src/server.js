@@ -489,6 +489,102 @@ app.post('/api/ladies/media/upload', upload.single('file'), async (req, res) => 
 
 
 
+
+
+app.delete('/api/ladies/:id', async (req, res) => {
+  const ladyId = Number(req.params.id || 0)
+
+  if (!ladyId) {
+    return res.status(400).json({
+      ok: false,
+      message: '缺少有效的 lady id，無法刪除。'
+    })
+  }
+
+  const db = getPool()
+  if (!db) {
+    return res.status(400).json({
+      ok: false,
+      message: '尚未設定 DATABASE_URL，無法刪除 Supabase 小姐資料。'
+    })
+  }
+
+  const client = await db.connect()
+
+  try {
+    await ensureDatabaseTables()
+    await client.query('begin')
+
+    const ladyResult = await client.query(
+      'select id, name, country from ladies where id = $1 limit 1',
+      [ladyId]
+    )
+
+    if (!ladyResult.rows.length) {
+      await client.query('rollback')
+      return res.status(404).json({
+        ok: false,
+        message: '找不到要刪除的小姐資料。'
+      })
+    }
+
+    const mediaResult = await client.query(
+      'select id, object_key, url from lady_media where lady_id = $1',
+      [ladyId]
+    )
+
+    const mediaRows = mediaResult.rows || []
+    const r2Deleted = []
+    const r2Failed = []
+
+    for (const media of mediaRows) {
+      if (!media.object_key) continue
+
+      try {
+        const r2 = getR2Client()
+        await r2.send(new DeleteObjectCommand({
+          Bucket: r2BucketName,
+          Key: media.object_key
+        }))
+        r2Deleted.push(media.object_key)
+      } catch (r2Error) {
+        console.warn('R2 delete failed when deleting lady:', media.object_key, r2Error)
+        r2Failed.push(media.object_key)
+      }
+    }
+
+    await client.query('delete from lady_media where lady_id = $1', [ladyId])
+    await client.query('delete from lady_price_plans where lady_id = $1', [ladyId])
+    await client.query('delete from lady_services where lady_id = $1', [ladyId])
+    await client.query('delete from ladies where id = $1', [ladyId])
+
+    await client.query('commit')
+
+    return res.json({
+      ok: true,
+      message: '小姐資料已從 Supabase 刪除；相關媒體若有 object_key 已嘗試刪除 R2 本體。',
+      item: ladyResult.rows[0],
+      deleted: {
+        mediaRows: mediaRows.length,
+        r2Deleted: r2Deleted.length,
+        r2Failed: r2Failed.length,
+        pricePlans: true,
+        services: true,
+        lady: true
+      }
+    })
+  } catch (error) {
+    await client.query('rollback')
+    console.error('DELETE /api/ladies/:id failed:', error)
+    return res.status(500).json({
+      ok: false,
+      message: error.message || String(error)
+    })
+  } finally {
+    client.release()
+  }
+})
+
 app.delete('/api/ladies/media/:id', async (req, res) => {
   try {
     await ensureDatabaseTables()
