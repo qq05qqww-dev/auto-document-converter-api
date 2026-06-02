@@ -573,8 +573,9 @@ app.patch('/api/ladies/:id', async (req, res) => {
           cup = $5,
           age = $6,
           raw_text = coalesce(nullif($7, ''), raw_text),
+          is_active = coalesce($8, is_active),
           updated_at = now()
-        where id = $8
+        where id = $9
         returning *
       `,
       [
@@ -585,6 +586,7 @@ app.patch('/api/ladies/:id', async (req, res) => {
         cup,
         body.age === '' || body.age === null || body.age === undefined ? null : Number(body.age),
         rawText,
+        typeof body.isActive === 'boolean' ? body.isActive : null,
         ladyId
       ]
     )

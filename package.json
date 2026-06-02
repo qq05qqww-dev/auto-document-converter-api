@@ -1,6 +1,6 @@
 {
   "name": "auto-document-converter-api",
-  "version": "0.0.14-2-edit-ladies-sync-supabase",
+  "version": "0.0.14-3-edit-ladies-status",
   "type": "module",
   "scripts": {
     "dev": "node src/server.js",
