@@ -12,7 +12,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const app = express()
-const APP_BATCH_VERSION = '0.0.18-14-backend-version-guard'
+const APP_BATCH_VERSION = '0.0.18-15-preview-current-doc-db-append'
 const port = Number(process.env.PORT || 5260)
 const dataDir = path.resolve(__dirname, '../data')
 const ladiesFile = path.join(dataDir, 'ladies.json')
@@ -267,7 +267,7 @@ app.get('/api/version', (_req, res) => {
   res.json({
     ok: true,
     version: APP_BATCH_VERSION,
-    batch: '018-14',
+    batch: '018-15',
     importMode: 'append_upsert_keep_existing',
     destructiveImportDisabled: true
   })
