@@ -12,6 +12,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const app = express()
+const APP_BATCH_VERSION = '0.0.18-14-backend-version-guard'
 const port = Number(process.env.PORT || 5260)
 const dataDir = path.resolve(__dirname, '../data')
 const ladiesFile = path.join(dataDir, 'ladies.json')
@@ -187,11 +188,88 @@ function normalizeItems(body) {
   }))
 }
 
+function makeLadyMergeKey(item) {
+  const country = String(item?.country || '').trim()
+  const name = String(item?.name || '').trim()
+  return `${country}__${name}`.toLowerCase()
+}
+
+function mergeLocalLadies(existingItems, incomingItems) {
+  const now = new Date().toISOString()
+  const merged = []
+  const indexByKey = new Map()
+
+  ;(Array.isArray(existingItems) ? existingItems : []).forEach((item, index) => {
+    const key = makeLadyMergeKey(item)
+    if (!key || key === '__') return
+
+    indexByKey.set(key, merged.length)
+    merged.push({
+      ...item,
+      sourceIndex: item.sourceIndex || index + 1
+    })
+  })
+
+  let createdCount = 0
+  let updatedCount = 0
+  let skippedCount = 0
+
+  ;(Array.isArray(incomingItems) ? incomingItems : []).forEach((item, index) => {
+    const key = makeLadyMergeKey(item)
+    if (!item?.name || !key || key === '__') {
+      skippedCount += 1
+      return
+    }
+
+    const nextItem = {
+      ...item,
+      id: item.id || `${Date.now()}-${index + 1}`,
+      importedAt: item.importedAt || now,
+      updatedAt: now
+    }
+
+    if (indexByKey.has(key)) {
+      const existingIndex = indexByKey.get(key)
+      merged[existingIndex] = {
+        ...merged[existingIndex],
+        ...nextItem,
+        id: merged[existingIndex].id || nextItem.id,
+        importedAt: merged[existingIndex].importedAt || nextItem.importedAt,
+        updatedAt: now
+      }
+      updatedCount += 1
+    } else {
+      indexByKey.set(key, merged.length)
+      merged.push(nextItem)
+      createdCount += 1
+    }
+  })
+
+  return {
+    items: merged,
+    createdCount,
+    updatedCount,
+    skippedCount
+  }
+}
+
+
 app.get('/api/health', async (_req, res) => {
   res.json({
     ok: true,
     message: 'auto-document-converter local API is running',
     time: new Date().toISOString()
+  })
+})
+
+
+app.get('/api/version', (_req, res) => {
+  res.json({
+    ok: true,
+    version: APP_BATCH_VERSION,
+    batch: '018-14',
+    importMode: 'append_upsert_keep_existing',
+    destructiveImportDisabled: true
   })
 })
 
@@ -228,16 +306,23 @@ app.post('/api/ladies/import', async (req, res) => {
     })
   }
 
-  const saved = await writeLadies(normalized.map((item, index) => ({
-    id: `${Date.now()}-${index + 1}`,
-    ...item,
-    importedAt: new Date().toISOString()
-  })))
+  const existing = await readLadies()
+  const beforeCount = Array.isArray(existing.items) ? existing.items.length : 0
+  const merged = mergeLocalLadies(existing.items, normalized)
+  const saved = await writeLadies(merged.items)
+  const afterCount = saved.count
 
   res.json({
     ok: true,
-    message: '已匯入本機 JSON 檔。',
-    count: saved.count,
+    message: `已匯入本機 JSON：匯入前 ${beforeCount} 筆，新增 ${merged.createdCount} 筆，更新 ${merged.updatedCount} 筆，略過 ${merged.skippedCount} 筆，匯入後 ${afterCount} 筆。`,
+    count: normalized.length,
+    beforeCount,
+    afterCount,
+    createdCount: merged.createdCount,
+    updatedCount: merged.updatedCount,
+    skippedCount: merged.skippedCount,
+    mode: 'local_append_upsert_keep_existing',
+    version: APP_BATCH_VERSION,
     dataFile: ladiesFile
   })
 })
@@ -266,40 +351,104 @@ app.post('/api/ladies/import-db', async (req, res) => {
     await ensureDatabaseTables()
     await client.query('begin')
 
-    await client.query('delete from ladies')
+    const beforeCountResult = await client.query('select count(*)::int as count from ladies')
+    const beforeCount = Number(beforeCountResult.rows[0]?.count || 0)
 
-    for (const [index, item] of normalized.entries()) {
+    let createdCount = 0
+    let updatedCount = 0
+    let skippedCount = 0
+
+    const maxSortResult = await client.query('select coalesce(max(sort_order), 0) as max_sort from ladies')
+    let nextSortOrder = Number(maxSortResult.rows[0]?.max_sort || 0) + 1
+
+    for (const item of normalized) {
+      const name = String(item.name || '').trim()
+      const country = String(item.country || '').trim()
       const body = item.body || {}
-      const insertedLady = await client.query(
+
+      if (!name) {
+        skippedCount += 1
+        continue
+      }
+
+      // 嚴格用「國籍 + 名稱」判斷同一位，不能因為新批次而清空舊批次。
+      const existingLadyResult = await client.query(
         `
-          insert into ladies (
-            country,
-            name,
-            height,
-            weight,
-            cup,
-            age,
-            raw_text,
-            sort_order,
-            imported_at,
-            updated_at
-          )
-          values ($1,$2,$3,$4,$5,$6,$7,$8,now(),now())
-          returning id
+          select id
+          from ladies
+          where lower(trim(coalesce(country, ''))) = lower(trim($1))
+            and lower(trim(coalesce(name, ''))) = lower(trim($2))
+          order by id asc
+          limit 1
         `,
-        [
-          item.country,
-          item.name,
-          body.height ?? null,
-          body.weight ?? null,
-          body.cup || '',
-          body.age ?? null,
-          item.rawText,
-          index + 1
-        ]
+        [country, name]
       )
 
-      const ladyId = insertedLady.rows[0].id
+      let ladyId = existingLadyResult.rows[0]?.id
+
+      if (ladyId) {
+        await client.query(
+          `
+            update ladies
+            set
+              height = $1,
+              weight = $2,
+              cup = $3,
+              age = $4,
+              raw_text = $5,
+              updated_at = now()
+            where id = $6
+          `,
+          [
+            body.height ?? null,
+            body.weight ?? null,
+            body.cup || '',
+            body.age ?? null,
+            item.rawText,
+            ladyId
+          ]
+        )
+
+        updatedCount += 1
+      } else {
+        const insertedLady = await client.query(
+          `
+            insert into ladies (
+              country,
+              name,
+              height,
+              weight,
+              cup,
+              age,
+              raw_text,
+              is_active,
+              sort_order,
+              imported_at,
+              updated_at
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,true,$8,now(),now())
+            returning id
+          `,
+          [
+            country,
+            name,
+            body.height ?? null,
+            body.weight ?? null,
+            body.cup || '',
+            body.age ?? null,
+            item.rawText,
+            nextSortOrder
+          ]
+        )
+
+        ladyId = insertedLady.rows[0].id
+        nextSortOrder += 1
+        createdCount += 1
+      }
+
+      // 只更新這位小姐自己的方案與服務；不碰其他小姐。
+      await client.query('delete from lady_price_plans where lady_id = $1', [ladyId])
+      await client.query('delete from lady_services where lady_id = $1', [ladyId])
 
       for (const [priceIndex, plan] of item.pricePlans.entries()) {
         await client.query(
@@ -326,6 +475,9 @@ app.post('/api/ladies/import-db', async (req, res) => {
       }
 
       for (const [serviceIndex, serviceName] of item.services.entries()) {
+        const cleanServiceName = String(serviceName || '').trim()
+        if (!cleanServiceName) continue
+
         await client.query(
           `
             insert into lady_services (
@@ -337,19 +489,33 @@ app.post('/api/ladies/import-db', async (req, res) => {
           `,
           [
             ladyId,
-            String(serviceName || '').trim(),
+            cleanServiceName,
             serviceIndex + 1
           ]
         )
       }
     }
 
+    const afterCountResult = await client.query('select count(*)::int as count from ladies')
+    const afterCount = Number(afterCountResult.rows[0]?.count || 0)
+
+    if (afterCount < beforeCount) {
+      throw new Error(`安全檢查失敗：匯入後筆數 ${afterCount} 小於匯入前 ${beforeCount}，已取消本次匯入。`)
+    }
+
     await client.query('commit')
 
     res.json({
       ok: true,
-      message: '已匯入 Supabase PostgreSQL。',
-      count: normalized.length
+      message: `已同步 Supabase：匯入前 ${beforeCount} 筆，新增 ${createdCount} 筆，更新 ${updatedCount} 筆，略過 ${skippedCount} 筆，匯入後 ${afterCount} 筆。舊小姐與媒體已保留。`,
+      count: normalized.length,
+      beforeCount,
+      afterCount,
+      createdCount,
+      updatedCount,
+      skippedCount,
+      mode: 'db_append_upsert_keep_existing_safety_checked',
+      version: APP_BATCH_VERSION
     })
   } catch (error) {
     await client.query('rollback')
@@ -485,107 +651,7 @@ app.post('/api/ladies/media/upload', upload.single('file'), async (req, res) => 
 })
 
 
-
-
-
-
-
-
-app.delete('/api/ladies/:id', async (req, res) => {
-  const ladyId = Number(req.params.id || 0)
-
-  if (!ladyId) {
-    return res.status(400).json({
-      ok: false,
-      message: '缺少有效的 lady id，無法刪除。'
-    })
-  }
-
-  const db = getPool()
-  if (!db) {
-    return res.status(400).json({
-      ok: false,
-      message: '尚未設定 DATABASE_URL，無法刪除 Supabase 小姐資料。'
-    })
-  }
-
-  const client = await db.connect()
-
-  try {
-    await ensureDatabaseTables()
-    await client.query('begin')
-
-    const ladyResult = await client.query(
-      'select id, name, country from ladies where id = $1 limit 1',
-      [ladyId]
-    )
-
-    if (!ladyResult.rows.length) {
-      await client.query('rollback')
-      return res.status(404).json({
-        ok: false,
-        message: '找不到要刪除的小姐資料。'
-      })
-    }
-
-    const mediaResult = await client.query(
-      'select id, object_key, url from lady_media where lady_id = $1',
-      [ladyId]
-    )
-
-    const mediaRows = mediaResult.rows || []
-    const r2Deleted = []
-    const r2Failed = []
-
-    for (const media of mediaRows) {
-      if (!media.object_key) continue
-
-      try {
-        const r2 = getR2Client()
-        await r2.send(new DeleteObjectCommand({
-          Bucket: r2BucketName,
-          Key: media.object_key
-        }))
-        r2Deleted.push(media.object_key)
-      } catch (r2Error) {
-        console.warn('R2 delete failed when deleting lady:', media.object_key, r2Error)
-        r2Failed.push(media.object_key)
-      }
-    }
-
-    await client.query('delete from lady_media where lady_id = $1', [ladyId])
-    await client.query('delete from lady_price_plans where lady_id = $1', [ladyId])
-    await client.query('delete from lady_services where lady_id = $1', [ladyId])
-    await client.query('delete from ladies where id = $1', [ladyId])
-
-    await client.query('commit')
-
-    return res.json({
-      ok: true,
-      message: '小姐資料已從 Supabase 刪除；相關媒體若有 object_key 已嘗試刪除 R2 本體。',
-      item: ladyResult.rows[0],
-      deleted: {
-        mediaRows: mediaRows.length,
-        r2Deleted: r2Deleted.length,
-        r2Failed: r2Failed.length,
-        pricePlans: true,
-        services: true,
-        lady: true
-      }
-    })
-  } catch (error) {
-    await client.query('rollback')
-    console.error('DELETE /api/ladies/:id failed:', error)
-    return res.status(500).json({
-      ok: false,
-      message: error.message || String(error)
-    })
-  } finally {
-    client.release()
-  }
-})
-
-app.delete('/api/ladies/media/:id', async (req, res) => {
+app.delete('/api/ladies/media/:mediaId', async (req, res) => {
   try {
     await ensureDatabaseTables()
 
@@ -593,229 +659,55 @@ app.delete('/api/ladies/media/:id', async (req, res) => {
     if (!db) {
       return res.status(400).json({
         ok: false,
-        message: '尚未設定 DATABASE_URL，無法刪除媒體資料。'
+        message: '尚未設定 DATABASE_URL，無法刪除媒體。'
       })
     }
 
-    const mediaId = Number(req.params.id || 0)
+    const mediaId = Number(req.params?.mediaId || 0)
     if (!mediaId) {
       return res.status(400).json({
         ok: false,
-        message: '缺少有效的 media id。'
+        message: '缺少 mediaId。'
       })
     }
 
-    const found = await db.query(
-      'select id, object_key, url from lady_media where id = $1 limit 1',
-      [mediaId]
-    )
+    const mediaResult = await db.query('select * from lady_media where id = $1 limit 1', [mediaId])
+    const mediaItem = mediaResult.rows[0]
 
-    if (!found.rows.length) {
+    if (!mediaItem) {
       return res.status(404).json({
         ok: false,
-        message: '找不到要刪除的媒體資料。'
+        message: '找不到指定媒體。'
       })
     }
 
-    const media = found.rows[0]
-
-    if (media.object_key) {
-      try {
-        const r2 = getR2Client()
-        await r2.send(new DeleteObjectCommand({
-          Bucket: r2BucketName,
-          Key: media.object_key
-        }))
-      } catch (r2Error) {
-        console.warn('R2 delete failed, continue deleting DB row:', r2Error)
-      }
+    if (mediaItem.object_key) {
+      const r2 = getR2Client()
+      await r2.send(new DeleteObjectCommand({
+        Bucket: r2BucketName,
+        Key: mediaItem.object_key
+      }))
     }
 
     await db.query('delete from lady_media where id = $1', [mediaId])
 
-    return res.json({
+    res.json({
       ok: true,
-      message: '媒體已從 Supabase 刪除；若有 R2 object_key 也已嘗試刪除。',
-      item: media
+      message: '媒體已從 Cloudflare R2 與 Supabase 綁定資料刪除。',
+      mediaId,
+      ladyId: mediaItem.lady_id
     })
   } catch (error) {
-    return res.status(500).json({
+    res.status(500).json({
       ok: false,
       message: error.message || String(error)
     })
   }
 })
 
-function parseTextLines(value) {
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => String(item || '').trim())
-      .filter(Boolean)
-  }
 
-  return String(value || '')
-    .split(/\r?\n/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-}
-
-function parsePricePlanText(priceText, sortOrder) {
-  const text = String(priceText || '').trim()
-  const priceMatch = text.match(/(\d+(?:\.\d+)?)\s*K/i)
-  const rawPriceMatch = text.match(/^(\d{3,5})\s*\//)
-  const minutesMatch = text.match(/\/\s*(\d+)\s*\//)
-  const sessionMatch = text.match(/\/\s*[^/]*?(\d+(?:\.\d+)?|0\.5)\s*S?/i)
-
-  let price = null
-  if (priceMatch) {
-    price = Math.round(Number(priceMatch[1]) * 1000)
-  } else if (rawPriceMatch) {
-    price = Number(rawPriceMatch[1])
-  }
-
-  return {
-    priceText: text,
-    price,
-    minutes: minutesMatch ? Number(minutesMatch[1]) : null,
-    sessions: sessionMatch ? Number(sessionMatch[1]) : 1,
-    sortOrder
-  }
-}
-
-app.patch('/api/ladies/:id', async (req, res) => {
-  const ladyId = Number(req.params.id || 0)
-
-  if (!ladyId) {
-    return res.status(400).json({
-      ok: false,
-      message: '缺少有效的 lady id。'
-    })
-  }
-
-  const db = getPool()
-  if (!db) {
-    return res.status(400).json({
-      ok: false,
-      message: '尚未設定 DATABASE_URL，無法更新 Supabase 小姐資料。'
-    })
-  }
-
-  const body = req.body || {}
-  const name = String(body.name || '').trim()
-  const country = String(body.country || body.nationality || body.city || '').trim()
-  const cup = String(body.cup || '').trim()
-  const rawText = String(body.rawText || body.raw_text || body.description || '').trim()
-  const priceLines = parseTextLines(body.pricePlansText || body.plansText || body.prices || body.plans)
-  const serviceLines = parseTextLines(body.servicesText || body.services || body.serviceList)
-
-  if (!name) {
-    return res.status(400).json({
-      ok: false,
-      message: '請先輸入姓名。'
-    })
-  }
-
-  const client = await db.connect()
-
+app.get('/api/public/ladies', async (_req, res) => {
   try {
-    await ensureDatabaseTables()
-    await client.query('begin')
-
-    const updatedLady = await client.query(
-      `
-        update ladies
-        set
-          country = $1,
-          name = $2,
-          height = $3,
-          weight = $4,
-          cup = $5,
-          age = $6,
-          raw_text = coalesce(nullif($7, ''), raw_text),
-          is_active = coalesce($8, is_active),
-          updated_at = now()
-        where id = $9
-        returning *
-      `,
-      [
-        country,
-        name,
-        body.height === '' || body.height === null || body.height === undefined ? null : Number(body.height),
-        body.weight === '' || body.weight === null || body.weight === undefined ? null : Number(body.weight),
-        cup,
-        body.age === '' || body.age === null || body.age === undefined ? null : Number(body.age),
-        rawText,
-        typeof body.isActive === 'boolean' ? body.isActive : null,
-        ladyId
-      ]
-    )
-
-    if (!updatedLady.rows.length) {
-      await client.query('rollback')
-      return res.status(404).json({
-        ok: false,
-        message: '找不到要更新的小姐資料。'
-      })
-    }
-
-    await client.query('delete from lady_price_plans where lady_id = $1', [ladyId])
-    for (const [index, line] of priceLines.entries()) {
-      const plan = parsePricePlanText(line, index + 1)
-      await client.query(
-        `
-          insert into lady_price_plans (
-            lady_id,
-            price_text,
-            price,
-            minutes,
-            sessions,
-            sort_order
-          )
-          values ($1, $2, $3, $4, $5, $6)
-        `,
-        [ladyId, plan.priceText, plan.price, plan.minutes, plan.sessions, plan.sortOrder]
-      )
-    }
-
-    await client.query('delete from lady_services where lady_id = $1', [ladyId])
-    for (const [index, serviceName] of serviceLines.entries()) {
-      await client.query(
-        `
-          insert into lady_services (
-            lady_id,
-            service_name,
-            sort_order
-          )
-          values ($1, $2, $3)
-        `,
-        [ladyId, serviceName, index + 1]
-      )
-    }
-
-    await client.query('commit')
-
-    return res.json({
-      ok: true,
-      message: '自動更新資料已同步更新到 Supabase。',
-      item: updatedLady.rows[0],
-      pricePlanCount: priceLines.length,
-      serviceCount: serviceLines.length
-    })
-  } catch (error) {
-    await client.query('rollback')
-    console.error('PATCH /api/ladies/:id failed:', error)
-    return res.status(500).json({
-      ok: false,
-      message: error.message || String(error)
-    })
-  } finally {
-    client.release()
-  }
-})
-
-app.get('/api/public/ladies', async (req, res) => {
-  try {
-    const includeInactive = String(req.query.includeInactive || '') === '1'
     await ensureDatabaseTables()
 
     const db = getPool()
@@ -835,9 +727,9 @@ app.get('/api/public/ladies', async (req, res) => {
         imported_at,
         updated_at
       from ladies
-      where ($1::boolean = true or is_active = true)
+      where is_active = true
       order by sort_order asc, id asc
-    `, [includeInactive])
+    `)
 
     const ladyIds = ladiesResult.rows.map(item => item.id)
 
@@ -965,8 +857,6 @@ app.get('/api/public/ladies', async (req, res) => {
     })
   }
 })
-
-
 
 
 app.listen(port, async () => {
