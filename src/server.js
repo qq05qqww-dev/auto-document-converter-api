@@ -12,7 +12,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const app = express()
-const APP_BATCH_VERSION = '0.0.18-15-preview-current-doc-db-append'
+const APP_BATCH_VERSION = '0.0.18-16-ladies-status-patch'
 const port = Number(process.env.PORT || 5260)
 const dataDir = path.resolve(__dirname, '../data')
 const ladiesFile = path.join(dataDir, 'ladies.json')
@@ -552,6 +552,155 @@ app.get('/api/ladies/db', async (_req, res) => {
   }
 })
 
+
+
+app.patch('/api/ladies/:id', async (req, res) => {
+  const ladyId = Number(req.params?.id || 0)
+
+  if (!ladyId) {
+    return res.status(400).json({
+      ok: false,
+      message: '缺少 lady id。'
+    })
+  }
+
+  const body = req.body || {}
+  const hasIsActive = Object.prototype.hasOwnProperty.call(body, 'isActive')
+    || Object.prototype.hasOwnProperty.call(body, 'is_active')
+    || Object.prototype.hasOwnProperty.call(body, 'status')
+
+  const nextIsActive = hasIsActive
+    ? (
+      body.isActive === true
+      || body.is_active === true
+      || body.status === 'published'
+      || body.status === 'active'
+      || body.status === '上架'
+    )
+    : null
+
+  try {
+    await ensureDatabaseTables()
+    const db = getPool()
+
+    if (db) {
+      const exists = await db.query('select * from ladies where id = $1 limit 1', [ladyId])
+      if (!exists.rows.length) {
+        return res.status(404).json({
+          ok: false,
+          message: '找不到指定小姐資料。'
+        })
+      }
+
+      const current = exists.rows[0]
+      const nextName = body.name !== undefined ? String(body.name || '').trim() : current.name
+      const nextCountry = body.country !== undefined || body.nationality !== undefined
+        ? String(body.country || body.nationality || '').trim()
+        : current.country
+      const nextHeight = body.height !== undefined && body.height !== ''
+        ? Number(body.height)
+        : current.height
+      const nextWeight = body.weight !== undefined && body.weight !== ''
+        ? Number(body.weight)
+        : current.weight
+      const nextCup = body.cup !== undefined ? String(body.cup || '').trim() : current.cup
+      const nextAge = body.age !== undefined && body.age !== ''
+        ? Number(body.age)
+        : current.age
+      const nextRawText = body.rawText !== undefined ? String(body.rawText || '') : current.raw_text
+      const activeValue = hasIsActive ? nextIsActive : current.is_active
+
+      const updated = await db.query(
+        `
+          update ladies
+          set
+            name = $1,
+            country = $2,
+            height = $3,
+            weight = $4,
+            cup = $5,
+            age = $6,
+            raw_text = $7,
+            is_active = $8,
+            updated_at = now()
+          where id = $9
+          returning *
+        `,
+        [
+          nextName,
+          nextCountry,
+          Number.isFinite(nextHeight) ? nextHeight : null,
+          Number.isFinite(nextWeight) ? nextWeight : null,
+          nextCup,
+          Number.isFinite(nextAge) ? nextAge : null,
+          nextRawText,
+          activeValue,
+          ladyId
+        ]
+      )
+
+      const item = updated.rows[0]
+
+      return res.json({
+        ok: true,
+        message: activeValue ? '小姐資料已更新並設為上架。' : '小姐資料已更新並設為下架。',
+        item: {
+          ...item,
+          isActive: item.is_active,
+          status: item.is_active ? 'published' : 'unpublished'
+        }
+      })
+    }
+
+    const localData = await readLadies()
+    const items = Array.isArray(localData.items) ? localData.items : []
+    const index = items.findIndex(item => Number(item.id) === ladyId || String(item.id) === String(ladyId))
+
+    if (index < 0) {
+      return res.status(404).json({
+        ok: false,
+        message: '找不到指定小姐資料。'
+      })
+    }
+
+    const current = items[index]
+    const activeValue = hasIsActive ? nextIsActive : (current.isActive ?? current.is_active ?? true)
+
+    items[index] = {
+      ...current,
+      name: body.name !== undefined ? String(body.name || '').trim() : current.name,
+      country: body.country !== undefined || body.nationality !== undefined
+        ? String(body.country || body.nationality || '').trim()
+        : current.country,
+      body: {
+        ...(current.body || {}),
+        height: body.height !== undefined ? body.height : current.body?.height,
+        weight: body.weight !== undefined ? body.weight : current.body?.weight,
+        cup: body.cup !== undefined ? body.cup : current.body?.cup,
+        age: body.age !== undefined ? body.age : current.body?.age
+      },
+      rawText: body.rawText !== undefined ? String(body.rawText || '') : current.rawText,
+      isActive: activeValue,
+      is_active: activeValue,
+      status: activeValue ? 'published' : 'unpublished',
+      updatedAt: new Date().toISOString()
+    }
+
+    const saved = await writeLadies(items)
+
+    return res.json({
+      ok: true,
+      message: activeValue ? '小姐資料已更新並設為上架。' : '小姐資料已更新並設為下架。',
+      item: items[index],
+      count: saved.count
+    })
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message || String(error)
+    })
+  }
+})
 
 
 app.post('/api/ladies/media/upload', upload.single('file'), async (req, res) => {
