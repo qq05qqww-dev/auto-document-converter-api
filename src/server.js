@@ -12,7 +12,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const app = express()
-const APP_BATCH_VERSION = '0.0.18-16-ladies-status-patch'
+const APP_BATCH_VERSION = '0.0.18-53-public-ladies-include-inactive'
 const port = Number(process.env.PORT || 5260)
 const dataDir = path.resolve(__dirname, '../data')
 const ladiesFile = path.join(dataDir, 'ladies.json')
@@ -855,11 +855,12 @@ app.delete('/api/ladies/media/:mediaId', async (req, res) => {
 })
 
 
-app.get('/api/public/ladies', async (_req, res) => {
+app.get('/api/public/ladies', async (req, res) => {
   try {
     await ensureDatabaseTables()
 
     const db = getPool()
+    const includeInactive = ['1', 'true', 'yes', 'all'].includes(String(req.query?.includeInactive || '').toLowerCase())
 
     const ladiesResult = await db.query(`
       select
@@ -876,7 +877,7 @@ app.get('/api/public/ladies', async (_req, res) => {
         imported_at,
         updated_at
       from ladies
-      where is_active = true
+      ${includeInactive ? '' : 'where is_active = true'}
       order by sort_order asc, id asc
     `)
 
@@ -886,6 +887,7 @@ app.get('/api/public/ladies', async (_req, res) => {
       return res.json({
         ok: true,
         count: 0,
+        includeInactive,
         items: []
       })
     }
@@ -986,6 +988,8 @@ app.get('/api/public/ladies', async (_req, res) => {
       age: item.age,
       rawText: item.raw_text,
       isActive: item.is_active,
+      is_active: item.is_active,
+      status: item.is_active ? 'published' : 'unpublished',
       sortOrder: item.sort_order,
       importedAt: item.imported_at,
       updatedAt: item.updated_at,
@@ -997,6 +1001,7 @@ app.get('/api/public/ladies', async (_req, res) => {
     res.json({
       ok: true,
       count: items.length,
+      includeInactive,
       items
     })
   } catch (error) {
@@ -1006,7 +1011,6 @@ app.get('/api/public/ladies', async (_req, res) => {
     })
   }
 })
-
 
 app.listen(port, async () => {
   await ensureDataFile()
